@@ -3,40 +3,31 @@
 """
 YVR -> ESB ucuz ucus tarayici + Telegram bildirimci.
 
-Fiyatlari Google Flights'tan dogrudan okur (fast-flights kutuphanesi) — API
-anahtari GEREKMEZ. Sadece Telegram bot token + chat_id yeterli.
+Fiyatlari Google Flights'tan dogrudan okur (fast-flights) — API anahtari
+GEREKMEZ. Sadece Telegram bot token + chat_id yeterli.
 
 Belirtilen tarih araligindaki (varsayilan 17-31 Agustos 2026) tek yon
-Vancouver -> Ankara uctan uca taranir, en ucuzlar bulunur ve Telegram'dan
-mesaj atilir. Fiyat bir onceki taramaya gore dusunce 📉, hedef fiyatin
-altina inince 🎯 isaretiyle uyarir.
+Vancouver -> Ankara taranir, en ucuzlar bulunur ve Telegram'dan mesaj atilir.
+Fiyat onceki taramaya gore dusunce 📉, hedef altina inince 🎯 isaretlenir.
 
-Gerekli ortam degiskenleri (.env'den de okunur):
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
-
-Istege bagli:
-    ORIGIN (YVR), DESTINATION (ESB)
-    START_DATE (2026-08-17), END_DATE (2026-08-31)
-    ADULTS (1), SEAT (economy)
-    MAX_STOPS (bos=sinirsiz, 0=direkt, 1=en fazla 1 aktarma)
-    PRICE_THRESHOLD, NOTIFY_ALWAYS (true), TOP_N (3)
-    FETCH_MODE (fallback), STATE_FILE (state.json)
+Gerekli: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Istege bagli: ORIGIN(YVR) DESTINATION(ESB) START_DATE END_DATE CURRENCY(CAD)
+              ADULTS(1) SEAT(economy) MAX_STOPS PRICE_THRESHOLD
+              NOTIFY_ALWAYS(true) TOP_N(3) STATE_FILE(state.json)
 """
 
 import os
 import sys
-import re
 import json
 import time
 import html
 import datetime as dt
 
 import requests
-from fast_flights import FlightData, Passengers, get_flights
+from fast_flights import FlightQuery, Passengers, create_filter, get_flights
 
 
-# ---------------------------------------------------------------- .env yukle
+# ------------------------------------------------------------- .env yukle
 def load_dotenv(path=".env"):
     if not os.path.exists(path):
         return
@@ -52,7 +43,7 @@ def load_dotenv(path=".env"):
 load_dotenv()
 
 
-# ---------------------------------------------------------------- Config
+# ------------------------------------------------------------- Config
 def env(name, default=None):
     v = os.environ.get(name)
     return v if v not in (None, "") else default
@@ -65,6 +56,7 @@ ORIGIN = env("ORIGIN", "YVR")
 DESTINATION = env("DESTINATION", "ESB")
 START_DATE = env("START_DATE", "2026-08-17")
 END_DATE = env("END_DATE", "2026-08-31")
+CURRENCY = env("CURRENCY", "CAD")
 ADULTS = int(env("ADULTS", "1"))
 SEAT = env("SEAT", "economy")
 MAX_STOPS = env("MAX_STOPS")
@@ -73,8 +65,10 @@ PRICE_THRESHOLD = env("PRICE_THRESHOLD")
 PRICE_THRESHOLD = float(PRICE_THRESHOLD) if PRICE_THRESHOLD else None
 NOTIFY_ALWAYS = env("NOTIFY_ALWAYS", "true").lower() == "true"
 TOP_N = int(env("TOP_N", "3"))
-FETCH_MODE = env("FETCH_MODE", "fallback")
 STATE_FILE = env("STATE_FILE", "state.json")
+
+AYLAR = ["Oca", "Sub", "Mar", "Nis", "May", "Haz",
+         "Tem", "Agu", "Eyl", "Eki", "Kas", "Ara"]
 
 
 def fail(msg):
@@ -82,65 +76,89 @@ def fail(msg):
     sys.exit(1)
 
 
-for _name, _val in [("TELEGRAM_BOT_TOKEN", TG_TOKEN),
-                    ("TELEGRAM_CHAT_ID", TG_CHAT)]:
-    if not _val:
-        fail(f"Ortam degiskeni eksik: {_name}")
+for _n, _v in [("TELEGRAM_BOT_TOKEN", TG_TOKEN), ("TELEGRAM_CHAT_ID", TG_CHAT)]:
+    if not _v:
+        fail(f"Ortam degiskeni eksik: {_n}")
 
 
-# ---------------------------------------------------------------- Fiyat ayikla
-def parse_price(s):
-    """'C$1,234' / '$540' -> 1234.0 / 540.0 (sayisal). Cikmazsa None."""
-    if not s:
-        return None
-    t = re.sub(r"[^0-9.,]", "", s).replace(",", "")
+# ------------------------------------------------------------- Tarih/sure
+def sdt_to_dt(sdt):
+    """fast-flights SimpleDatetime -> datetime (ya da None)."""
     try:
-        return float(t)
-    except ValueError:
+        y, m, d = sdt.date
+        hh, mm = sdt.time
+        return dt.datetime(y, m, d, hh, mm)
+    except Exception:
         return None
 
 
-# ---------------------------------------------------------------- Arama
+def fmt_sdt(sdt):
+    x = sdt_to_dt(sdt)
+    if not x:
+        return "?"
+    return f"{x.day} {AYLAR[x.month - 1]} {x.strftime('%H:%M')}"
+
+
+def fmt_dur(minutes):
+    if minutes is None:
+        return ""
+    return f"{minutes // 60}sa {minutes % 60}dk"
+
+
+# ------------------------------------------------------------- Arama
 def search_cheapest(date):
     """Tek bir tarih icin en ucuz tek yon ucusu (dict) ya da None."""
     try:
-        res = get_flights(
-            flight_data=[FlightData(date=date,
-                                    from_airport=ORIGIN,
-                                    to_airport=DESTINATION)],
+        flt = create_filter(
+            flights=[FlightQuery(date=date,
+                                 from_airport=ORIGIN,
+                                 to_airport=DESTINATION,
+                                 max_stops=MAX_STOPS)],
             trip="one-way",
             seat=SEAT,
             passengers=Passengers(adults=ADULTS, children=0,
                                   infants_in_seat=0, infants_on_lap=0),
-            fetch_mode=FETCH_MODE,
+            currency=CURRENCY,
+            max_stops=MAX_STOPS,
         )
+        result = get_flights(flt)
     except Exception as e:
         print(f"[uyari] {date}: arama hatasi: {e}")
         return None
 
     best = None
-    for f in getattr(res, "flights", []) or []:
-        price_num = parse_price(getattr(f, "price", ""))
-        if price_num is None:
+    for f in result or []:
+        try:
+            price = int(getattr(f, "price", 0) or 0)
+        except (TypeError, ValueError):
             continue
-        stops = getattr(f, "stops", 0) or 0
+        if price <= 0:
+            continue
+        legs = getattr(f, "flights", []) or []
+        stops = max(len(legs) - 1, 0)
         if MAX_STOPS is not None and stops > MAX_STOPS:
             continue
+
+        dep = legs[0].departure if legs else None
+        dep_dt = sdt_to_dt(dep) if legs else None
+        arr_dt = sdt_to_dt(legs[-1].arrival) if legs else None
+        dur = int((arr_dt - dep_dt).total_seconds() // 60) \
+            if (dep_dt and arr_dt) else None
+        airlines = getattr(f, "airlines", None) or []
         cand = {
             "date": date,
-            "price_num": price_num,
-            "price_str": getattr(f, "price", "?"),
+            "price": price,
             "stops": stops,
-            "name": getattr(f, "name", "?"),
-            "duration": getattr(f, "duration", ""),
-            "departure": getattr(f, "departure", date),
+            "airlines": ", ".join(airlines) if airlines else "?",
+            "dep": fmt_sdt(dep) if dep else date,
+            "dur": fmt_dur(dur),
         }
-        if best is None or price_num < best["price_num"]:
+        if best is None or price < best["price"]:
             best = cand
     return best
 
 
-# ---------------------------------------------------------------- Telegram
+# ------------------------------------------------------------- Telegram
 def send_telegram(text):
     r = requests.post(
         f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -154,7 +172,7 @@ def send_telegram(text):
         print("Telegram mesaji gonderildi.")
 
 
-# ---------------------------------------------------------------- Durum
+# ------------------------------------------------------------- Durum
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -186,41 +204,41 @@ def esc(s):
     return html.escape(str(s))
 
 
-# ---------------------------------------------------------------- Ana akis
+# ------------------------------------------------------------- Ana akis
 def main():
     results = []
     for date in daterange(START_DATE, END_DATE):
         best = search_cheapest(date)
         if best:
             results.append(best)
-            print(f"{date}: {best['price_str']} "
-                  f"({best['stops']} aktarma, {best['name']})")
+            print(f"{date}: {best['price']} {CURRENCY} "
+                  f"({best['stops']} aktarma, {best['airlines']})")
         else:
             print(f"{date}: sonuc yok")
-        time.sleep(1.5)   # Google'a nazik ol
+        time.sleep(2)
 
     if not results:
         send_telegram(
             f"⚠️ <b>{esc(ORIGIN)} → {esc(DESTINATION)}</b> icin "
-            f"{START_DATE} – {END_DATE} araliginda sonuc alinamadi."
+            f"{START_DATE} – {END_DATE} araliginda sonuc alinamadi.\n"
+            f"(Google gecici engellemis olabilir; bir sonraki taramada tekrar denenecek.)"
         )
         return
 
-    results.sort(key=lambda x: x["price_num"])
+    results.sort(key=lambda x: x["price"])
     cheapest = results[0]
 
     state = load_state()
     key = f"{ORIGIN}-{DESTINATION}-{START_DATE}-{END_DATE}"
     prev = state.get(key, {}).get("price")
 
-    is_drop = prev is not None and cheapest["price_num"] < prev - 0.5
+    is_drop = prev is not None and cheapest["price"] < prev
     below_threshold = (PRICE_THRESHOLD is not None
-                       and cheapest["price_num"] <= PRICE_THRESHOLD)
+                       and cheapest["price"] <= PRICE_THRESHOLD)
     should_send = NOTIFY_ALWAYS or is_drop or below_threshold
 
-    if prev is None or cheapest["price_num"] < prev:
-        state[key] = {"price": cheapest["price_num"],
-                      "date": cheapest["date"],
+    if prev is None or cheapest["price"] < prev:
+        state[key] = {"price": cheapest["price"], "date": cheapest["date"],
                       "updated": dt.datetime.now().isoformat(timespec="minutes")}
         save_state(state)
 
@@ -228,21 +246,21 @@ def main():
         print("Bildirim kosulu yok — mesaj atlandi.")
         return
 
-    lines = [f"✈️ <b>{esc(ORIGIN)} → {esc(DESTINATION)}</b> · tek yon"]
+    lines = [f"✈️ <b>{esc(ORIGIN)} → {esc(DESTINATION)}</b> · tek yon · {CURRENCY}"]
     if is_drop:
-        lines.append(f"📉 <b>Fiyat dustu!</b> Onceki en dusuk: {prev:.0f}")
+        lines.append(f"📉 <b>Fiyat dustu!</b> Onceki en dusuk: {prev} {CURRENCY}")
     if below_threshold:
         lines.append(f"🎯 <b>Hedefin altinda!</b> (hedef: {PRICE_THRESHOLD:.0f})")
 
     c = cheapest
     lines.append("")
-    lines.append(f"🏆 <b>{esc(c['price_str'])}</b> — {esc(c['departure'])}")
-    lines.append(f"{c['stops']} aktarma · {esc(c['name'])} · {esc(c['duration'])}")
+    lines.append(f"🏆 <b>{c['price']} {CURRENCY}</b> — {esc(c['dep'])} kalkis")
+    lines.append(f"{c['stops']} aktarma · {esc(c['airlines'])} · {esc(c['dur'])}")
     lines.append("")
-    lines.append("📅 <b>En ucuz secenekler:</b>")
+    lines.append("📅 <b>En ucuz tarihler:</b>")
     for r in results[:TOP_N]:
-        lines.append(f"• <b>{esc(r['price_str'])}</b> — {esc(r['departure'])} "
-                     f"({r['stops']} aktarma, {esc(r['name'])})")
+        lines.append(f"• <b>{r['price']} {CURRENCY}</b> — {esc(r['dep'])} "
+                     f"({r['stops']} aktarma, {esc(r['airlines'])})")
     lines.append("")
     lines.append(f"🔎 {START_DATE} – {END_DATE} tarandi · "
                  f"{dt.datetime.now().strftime('%d.%m %H:%M')}")
