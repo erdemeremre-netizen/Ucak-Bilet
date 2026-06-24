@@ -1,0 +1,32 @@
+name: Ucak ucus tarayici
+on:
+  schedule:
+    - cron: 0 14 * * *
+  workflow_dispatch: {}
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Durum dosyasini geri yukle
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: flight-state-${{ github.run_id }}
+          restore-keys: |
+            flight-state-
+      - name: Tara ve bildir
+        env:
+          AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
+          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          START_DATE: "2026-08-17"
+          END_DATE: "2026-08-31"
+          CURRENCY: "CAD"
+          NOTIFY_ALWAYS: "true"
+        run: python flight_tracker.py
