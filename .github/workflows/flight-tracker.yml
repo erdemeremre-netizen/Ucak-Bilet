@@ -1,7 +1,7 @@
 name: Ucak ucus tarayici
 on:
   schedule:
-    - cron: 0 * * * *
+    - cron: 18 * * * *
   workflow_dispatch: {}
 jobs:
   scan:
